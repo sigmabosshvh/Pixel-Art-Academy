@@ -9,7 +9,6 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-2022
-    timeout-minutes: 120
 
     env:
       METEOR_PRETTY_OUTPUT: "0"
@@ -183,7 +182,7 @@ jobs:
         run: |
           npm run desktop -- package `
             --build-meteor `
-            --build-timeout 1800 `
+            --build-timeout 20000 `
             --production
 
       - name: Verify Windows package
