@@ -1,0 +1,248 @@
+name: Build Learn Mode for Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    env:
+      METEOR_PRETTY_OUTPUT: "0"
+      METEOR_NO_RELEASE_CHECK: "1"
+      MD_LOG_LEVEL: "INFO,WARN,ERROR"
+
+    steps:
+      - name: Checkout Pixel Art Academy learn-mode
+        uses: actions/checkout@v4
+        with:
+          repository: Retronator/Pixel-Art-Academy
+          ref: learn-mode
+          path: Pixel-Art-Academy
+          persist-credentials: false
+
+      - name: Checkout Retronator meteor-desktop
+        uses: actions/checkout@v4
+        with:
+          repository: Retronator/meteor-desktop
+          ref: master
+          path: meteor-desktop
+          persist-credentials: false
+
+      - name: Set up Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18.19.1
+          cache: npm
+          cache-dependency-path: |
+            Pixel-Art-Academy/package-lock.json
+            meteor-desktop/package-lock.json
+
+      - name: Show initial disk space
+        shell: pwsh
+        run: |
+          Get-PSDrive C
+
+      - name: Install Meteor 2.16
+        shell: pwsh
+        run: |
+          npm install --global meteor@2.16.0 --foreground-script
+          meteor --version
+
+          $version = meteor --version
+          if ($version -notmatch "2\.16") {
+            throw "Meteor 2.16 was not installed. Actual version: $version"
+          }
+
+      - name: Install and compile meteor-desktop
+        working-directory: meteor-desktop
+        shell: pwsh
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+          if (-not (Test-Path "dist/bin/cli.js")) {
+            throw "meteor-desktop did not produce dist/bin/cli.js"
+          }
+
+      - name: Disable Steam integration
+        working-directory: Pixel-Art-Academy
+        shell: pwsh
+        run: |
+          node -e @'
+          const fs = require("fs");
+
+          const settingsPath = ".desktop/settings.json";
+          const settings = JSON.parse(
+            fs.readFileSync(settingsPath, "utf8")
+          );
+
+          if (settings.dependencies) {
+            delete settings.dependencies["steamworks.js"];
+          }
+
+          settings.packagerOptions =
+            settings.packagerOptions || {};
+
+          settings.packagerOptions.platform = "win32";
+          settings.packagerOptions.arch = "x64";
+
+          fs.writeFileSync(
+            settingsPath,
+            JSON.stringify(settings, null, 2) + "\n",
+            "utf8"
+          );
+
+          console.log(
+            "Updated desktop settings:",
+            JSON.stringify(settings.packagerOptions, null, 2)
+          );
+          '@
+
+          @'
+          import moduleJson from './module.json';
+
+          export default class Steam {
+            constructor({ log, Module }) {
+              this.log = log;
+              this.module = new Module(moduleJson.name);
+
+              this.module.on(
+                'initialize',
+                (event, fetchId) => {
+                  this.log.verbose(
+                    'Steam is disabled in this build.'
+                  );
+
+                  this.module.respond(
+                    'initialize',
+                    fetchId,
+                    null
+                  );
+                }
+              );
+
+              this.module.on(
+                'setEnabledForApp',
+                (event, fetchId) => {
+                  this.module.respond(
+                    'setEnabledForApp',
+                    fetchId,
+                    null
+                  );
+                }
+              );
+            }
+          }
+          '@ | Set-Content `
+            ".desktop/modules/steam/index.js" `
+            -Encoding utf8
+
+          Write-Host "Resulting settings.json:"
+          Get-Content ".desktop/settings.json"
+
+          Write-Host "Resulting Steam stub:"
+          Get-Content ".desktop/modules/steam/index.js"
+
+      - name: Install application dependencies
+        working-directory: Pixel-Art-Academy
+        shell: pwsh
+        run: |
+          meteor npm install
+          meteor npm --version
+
+      - name: Build portable Windows package
+        working-directory: Pixel-Art-Academy
+        shell: pwsh
+        run: |
+          npm run desktop -- package `
+            --build-meteor `
+            --build-timeout 1800 `
+            --production
+
+      - name: Verify Windows package
+        working-directory: Pixel-Art-Academy
+        shell: pwsh
+        run: |
+          if (-not (Test-Path ".desktop-package")) {
+            throw ".desktop-package was not created."
+          }
+
+          Write-Host "Produced files:"
+          Get-ChildItem ".desktop-package" -Recurse |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize
+
+          $exe = Get-ChildItem `
+            ".desktop-package" `
+            -Recurse `
+            -Filter "*.exe" |
+            Where-Object {
+              $_.Name -notmatch "unins|uninstall"
+            } |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "No Windows executable was produced."
+          }
+
+          Write-Host "Executable found:"
+          Write-Host $exe.FullName
+          Write-Host "Size: $($exe.Length) bytes"
+
+      - name: Prepare artifact directory
+        working-directory: Pixel-Art-Academy
+        shell: pwsh
+        run: |
+          $source = (
+            Resolve-Path ".desktop-package"
+          ).Path
+
+          $destination = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "windows-build"
+
+          if (Test-Path $destination) {
+            Remove-Item `
+              $destination `
+              -Recurse `
+              -Force
+          }
+
+          Move-Item `
+            -Path $source `
+            -Destination $destination
+
+          Write-Host "Artifact contents:"
+          Get-ChildItem $destination -Recurse |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize
+
+          Get-PSDrive C
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pixel-Art-Academy-Learn-Mode-Windows-x64
+          path: windows-build
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pixel-Art-Academy-build-logs
+          path: |
+            Pixel-Art-Academy/meteor.log
+            Pixel-Art-Academy/npm-debug.log
+            Pixel-Art-Academy/.meteor/local/**/*.log
+            meteor-desktop/npm-debug.log
+          if-no-files-found: ignore
+          retention-days: 7
+          include-hidden-files: true
