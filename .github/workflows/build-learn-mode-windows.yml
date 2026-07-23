@@ -51,13 +51,35 @@ jobs:
         shell: pwsh
         run: |
           npm install --global meteor@2.16.0 --foreground-script
-          meteor --version
+
+          $meteorDir = Join-Path $env:LOCALAPPDATA ".meteor"
+
+          if (-not (Test-Path $meteorDir)) {
+            throw "Meteor directory was not created: $meteorDir"
+          }
+
+          $meteorDir |
+            Out-File `
+              -FilePath $env:GITHUB_PATH `
+              -Encoding utf8 `
+              -Append
+
+          Write-Host "Meteor installed in: $meteorDir"
+          Get-ChildItem $meteorDir
+
+      - name: Verify Meteor 2.16
+        shell: pwsh
+        run: |
+          $command = Get-Command meteor -ErrorAction Stop
+          Write-Host "Meteor command: $($command.Source)"
 
           $version = meteor --version
+          Write-Host "Meteor version: $version"
+
           if ($version -notmatch "2\.16") {
             throw "Meteor 2.16 was not installed. Actual version: $version"
           }
-
+          
       - name: Install and compile meteor-desktop
         working-directory: meteor-desktop
         shell: pwsh
