@@ -1,7 +1,11 @@
-name: Build Learn Mode for Windows
+name: Build Learn Mode for Windows (diagnostic)
 
 on:
   workflow_dispatch:
+    inputs:
+      meteor_limit_minutes:
+        required: true
+        default: "300"
 
 permissions:
   contents: read
@@ -41,48 +45,48 @@ jobs:
             Pixel-Art-Academy/package-lock.json
             meteor-desktop/package-lock.json
 
-      - name: Show initial disk space
+      - name: Restore Meteor cache
+        id: meteor-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~\AppData\Local\.meteor
+          key: meteor-windows-2.16-${{ hashFiles('Pixel-Art-Academy/.meteor/release', 'Pixel-Art-Academy/.meteor/versions') }}
+          restore-keys: |
+            meteor-windows-2.16-
+
+      - name: Install or restore Meteor 2.16
         shell: pwsh
         run: |
-          Get-PSDrive C
-
-      - name: Install Meteor 2.16
-        shell: pwsh
-        run: |
-          npm install --global meteor@2.16.0 --foreground-script
-
+          $ErrorActionPreference = "Stop"
           $meteorDir = Join-Path $env:LOCALAPPDATA ".meteor"
 
-          if (-not (Test-Path $meteorDir)) {
-            throw "Meteor directory was not created: $meteorDir"
+          $env:PATH = "$meteorDir;$env:PATH"
+
+          if (-not (Get-Command meteor -ErrorAction SilentlyContinue)) {
+            npm install --global meteor@2.16.0 --foreground-script
+            $env:PATH = "$meteorDir;$env:PATH"
           }
 
+          # PATH последующих шагов.
           $meteorDir |
             Out-File `
               -FilePath $env:GITHUB_PATH `
               -Encoding utf8 `
               -Append
 
-          Write-Host "Meteor installed in: $meteorDir"
-          Get-ChildItem $meteorDir
-
-      - name: Verify Meteor 2.16
-        shell: pwsh
-        run: |
-          $command = Get-Command meteor -ErrorAction Stop
-          Write-Host "Meteor command: $($command.Source)"
-
           $version = meteor --version
           Write-Host "Meteor version: $version"
 
           if ($version -notmatch "2\.16") {
-            throw "Meteor 2.16 was not installed. Actual version: $version"
+            throw "Expected Meteor 2.16, got: $version"
           }
-          
+
       - name: Install and compile meteor-desktop
         working-directory: meteor-desktop
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           npm install --no-audit --no-fund
           npm run build
 
@@ -94,35 +98,26 @@ jobs:
         working-directory: Pixel-Art-Academy
         shell: pwsh
         run: |
-          node -e @'
-          const fs = require("fs");
+          $ErrorActionPreference = "Stop"
 
-          const settingsPath = ".desktop/settings.json";
-          const settings = JSON.parse(
-            fs.readFileSync(settingsPath, "utf8")
-          );
+          $settingsPath = ".desktop/settings.json"
+          $settings = Get-Content $settingsPath -Raw |
+            ConvertFrom-Json
 
-          if (settings.dependencies) {
-            delete settings.dependencies["steamworks.js"];
+          if ($settings.dependencies) {
+            $settings.dependencies.PSObject.Properties.Remove(
+              "steamworks.js"
+            )
           }
 
-          settings.packagerOptions =
-            settings.packagerOptions || {};
+          $settings.packagerOptions.platform = "win32"
+          $settings.packagerOptions.arch = "x64"
 
-          settings.packagerOptions.platform = "win32";
-          settings.packagerOptions.arch = "x64";
-
-          fs.writeFileSync(
-            settingsPath,
-            JSON.stringify(settings, null, 2) + "\n",
-            "utf8"
-          );
-
-          console.log(
-            "Updated desktop settings:",
-            JSON.stringify(settings.packagerOptions, null, 2)
-          );
-          '@
+          $settings |
+            ConvertTo-Json -Depth 100 |
+            Set-Content `
+              $settingsPath `
+              -Encoding utf8NoBOM
 
           @'
           import moduleJson from './module.json';
@@ -161,89 +156,423 @@ jobs:
           }
           '@ | Set-Content `
             ".desktop/modules/steam/index.js" `
-            -Encoding utf8
+            -Encoding utf8NoBOM
 
-          Write-Host "Resulting settings.json:"
-          Get-Content ".desktop/settings.json"
-
-          Write-Host "Resulting Steam stub:"
-          Get-Content ".desktop/modules/steam/index.js"
+          Write-Host "Steam dependency removed."
+          Write-Host "Target set to Windows x64."
 
       - name: Install application dependencies
         working-directory: Pixel-Art-Academy
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           meteor npm install
-          meteor npm --version
 
-      - name: Build portable Windows package
+      - name: Build Meteor with live diagnostics and package
         working-directory: Pixel-Art-Academy
         shell: pwsh
         run: |
-          npm run desktop -- package `
-            --build-meteor `
-            --build-timeout 20000 `
-            --production
+          $ErrorActionPreference = "Stop"
+
+          $logDir = Join-Path $PWD "build-logs"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $logDir |
+            Out-Null
+
+          $stdoutLog = Join-Path `
+            $logDir `
+            "meteor.stdout.log"
+
+          $stderrLog = Join-Path `
+            $logDir `
+            "meteor.stderr.log"
+
+          $diagnosticLog = Join-Path `
+            $logDir `
+            "diagnostics.log"
+
+          $packageLog = Join-Path `
+            $logDir `
+            "package.log"
+
+          $programJson = Join-Path `
+            $PWD `
+            ".meteor/local/build/programs/web.cordova/program.json"
+
+          function Write-Diagnostic {
+            param([string]$Message)
+
+            $line = "[{0}] {1}" -f (
+              Get-Date -Format "yyyy-MM-ddTHH:mm:ss.fffK"
+            ), $Message
+
+            Write-Host $line
+
+            Add-Content `
+              -Path $diagnosticLog `
+              -Value $line `
+              -Encoding utf8
+          }
+
+          function Show-FileTail {
+            param(
+              [string]$Label,
+              [string]$Path,
+              [int]$Lines = 80
+            )
+
+            Write-Host "::group::$Label"
+
+            if (Test-Path $Path) {
+              Get-Content `
+                $Path `
+                -Tail $Lines `
+                -ErrorAction SilentlyContinue
+            } else {
+              Write-Host "File has not been created yet:"
+              Write-Host $Path
+            }
+
+            Write-Host "::endgroup::"
+          }
+
+          function Test-MeteorReady {
+            if (-not (Test-Path $programJson)) {
+              return $false
+            }
+
+            try {
+              $index = Invoke-WebRequest `
+                -Uri "http://127.0.0.1:3080/__cordova/index.html" `
+                -TimeoutSec 10 `
+                -UseBasicParsing
+
+              $manifest = Invoke-WebRequest `
+                -Uri "http://127.0.0.1:3080/__cordova/manifest.json?meteor_dont_serve_index=true" `
+                -TimeoutSec 10 `
+                -UseBasicParsing
+
+              return (
+                $index.StatusCode -eq 200 -and
+                $manifest.StatusCode -eq 200
+              )
+            } catch {
+              return $false
+            }
+          }
+
+          function Show-SystemState {
+            Write-Host "::group::Disk and process state"
+
+            Get-PSDrive C |
+              Select-Object `
+                Name,
+                @{
+                  Name = "UsedGB"
+                  Expression = {
+                    [math]::Round($_.Used / 1GB, 2)
+                  }
+                },
+                @{
+                  Name = "FreeGB"
+                  Expression = {
+                    [math]::Round($_.Free / 1GB, 2)
+                  }
+                } |
+              Format-Table -AutoSize
+
+            Get-Process `
+              -Name node, mongod `
+              -ErrorAction SilentlyContinue |
+              Sort-Object CPU -Descending |
+              Select-Object `
+                -First 20 `
+                Id,
+                ProcessName,
+                @{
+                  Name = "CPUSeconds"
+                  Expression = {
+                    [math]::Round($_.CPU, 1)
+                  }
+                },
+                @{
+                  Name = "RAMMB"
+                  Expression = {
+                    [math]::Round(
+                      $_.WorkingSet64 / 1MB,
+                      1
+                    )
+                  }
+                },
+                StartTime |
+              Format-Table -AutoSize
+
+            if (Test-Path $programJson) {
+              Get-Item $programJson |
+                Select-Object `
+                  FullName,
+                  Length,
+                  LastWriteTime |
+                Format-List
+            } else {
+              Write-Host `
+                "web.cordova/program.json does not exist yet."
+            }
+
+            Get-Item `
+              $stdoutLog,
+              $stderrLog `
+              -ErrorAction SilentlyContinue |
+              Select-Object `
+                FullName,
+                Length,
+                LastWriteTime |
+              Format-Table -AutoSize
+
+            Write-Host "::endgroup::"
+          }
+
+          $meteorArguments = @(
+            "run",
+            "--verbose",
+            "--mobile-server=http://127.0.0.1:3000",
+            "--production",
+            "-p",
+            "3080"
+          )
+
+          $meteorCommandLine = (
+            "meteor {0}" -f (
+              $meteorArguments -join " "
+            )
+          )
+
+          Write-Diagnostic (
+            "Starting Meteor: $meteorCommandLine"
+          )
+
+          # cmd.exe используется, чтобы одинаково запускать
+          # meteor.bat, meteor.cmd или другой Windows shim.
+          $meteorProcess = Start-Process `
+            -FilePath $env:ComSpec `
+            -ArgumentList @(
+              "/d",
+              "/s",
+              "/c",
+              $meteorCommandLine
+            ) `
+            -WorkingDirectory $PWD.Path `
+            -RedirectStandardOutput $stdoutLog `
+            -RedirectStandardError $stderrLog `
+            -NoNewWindow `
+            -PassThru
+
+          $startedAt = Get-Date
+
+          $limitMinutes = [int](
+            "${{ inputs.meteor_limit_minutes }}"
+          )
+
+          $deadline = $null
+
+          if ($limitMinutes -gt 0) {
+            $deadline = $startedAt.AddMinutes(
+              $limitMinutes
+            )
+
+            Write-Diagnostic (
+              "Graceful diagnostic deadline: $deadline"
+            )
+          } else {
+            Write-Diagnostic (
+              "No internal Meteor deadline; " +
+              "GitHub's job limit is the only limit."
+            )
+          }
+
+          $ready = $false
+          $heartbeat = 0
+
+          try {
+            while ($true) {
+              $meteorProcess.Refresh()
+
+              if (Test-MeteorReady) {
+                $ready = $true
+
+                Write-Diagnostic (
+                  "Meteor web.cordova endpoint is ready."
+                )
+
+                break
+              }
+
+              if ($meteorProcess.HasExited) {
+                Write-Diagnostic (
+                  "Meteor exited with code " +
+                  "$($meteorProcess.ExitCode)."
+                )
+
+                break
+              }
+
+              if (
+                $null -ne $deadline -and
+                (Get-Date) -ge $deadline
+              ) {
+                Write-Diagnostic (
+                  "Graceful diagnostic deadline reached."
+                )
+
+                break
+              }
+
+              Start-Sleep -Seconds 60
+              $heartbeat++
+
+              $elapsed = (Get-Date) - $startedAt
+
+              Write-Diagnostic (
+                "Heartbeat #{0}; elapsed {1:hh\:mm\:ss}; PID {2}" -f
+                $heartbeat,
+                $elapsed,
+                $meteorProcess.Id
+              )
+
+              if (($heartbeat % 5) -eq 0) {
+                Show-FileTail `
+                  "Meteor stdout — last 80 lines" `
+                  $stdoutLog
+
+                Show-FileTail `
+                  "Meteor stderr — last 80 lines" `
+                  $stderrLog
+
+                Show-SystemState
+              }
+            }
+
+            if (-not $ready) {
+              Show-FileTail `
+                "Final Meteor stdout" `
+                $stdoutLog `
+                200
+
+              Show-FileTail `
+                "Final Meteor stderr" `
+                $stderrLog `
+                200
+
+              Show-SystemState
+
+              if ($meteorProcess.HasExited) {
+                throw (
+                  "Meteor exited before web.cordova " +
+                  "became ready."
+                )
+              }
+
+              throw (
+                "Meteor did not become ready before " +
+                "the diagnostic deadline."
+              )
+            }
+
+            Write-Diagnostic (
+              "Running meteor-desktop package against " +
+              "the live Meteor server."
+            )
+
+            & npm.cmd run desktop -- package `
+              http://127.0.0.1:3000 `
+              --production `
+              --port 3080 2>&1 |
+              Tee-Object -FilePath $packageLog
+
+            $packageExitCode = $LASTEXITCODE
+
+            if ($packageExitCode -ne 0) {
+              throw (
+                "meteor-desktop package failed with " +
+                "exit code $packageExitCode"
+              )
+            }
+
+            if (-not (Test-Path ".desktop-package")) {
+              throw ".desktop-package was not created."
+            }
+
+            Write-Diagnostic (
+              "Windows package was created successfully."
+            )
+          } finally {
+            if ($null -ne $meteorProcess) {
+              $meteorProcess.Refresh()
+
+              if (-not $meteorProcess.HasExited) {
+                Write-Diagnostic (
+                  "Stopping Meteor process tree."
+                )
+
+                & taskkill.exe `
+                  /PID $meteorProcess.Id `
+                  /T `
+                  /F |
+                  Out-Null
+              }
+            }
+          }
 
       - name: Verify Windows package
         working-directory: Pixel-Art-Academy
         shell: pwsh
         run: |
-          if (-not (Test-Path ".desktop-package")) {
-            throw ".desktop-package was not created."
-          }
-
-          Write-Host "Produced files:"
-          Get-ChildItem ".desktop-package" -Recurse |
-            Select-Object FullName, Length |
-            Format-Table -AutoSize
+          $ErrorActionPreference = "Stop"
 
           $exe = Get-ChildItem `
             ".desktop-package" `
             -Recurse `
-            -Filter "*.exe" |
-            Where-Object {
-              $_.Name -notmatch "unins|uninstall"
-            } |
+            -Filter "Pixel Art Academy Learn Mode.exe" |
             Select-Object -First 1
+
+          if (-not $exe) {
+            $exe = Get-ChildItem `
+              ".desktop-package" `
+              -Recurse `
+              -Filter "*.exe" |
+              Sort-Object Length -Descending |
+              Select-Object -First 1
+          }
 
           if (-not $exe) {
             throw "No Windows executable was produced."
           }
 
-          Write-Host "Executable found:"
-          Write-Host $exe.FullName
+          Write-Host "Executable: $($exe.FullName)"
           Write-Host "Size: $($exe.Length) bytes"
 
-      - name: Prepare artifact directory
+      - name: Prepare build artifact
         working-directory: Pixel-Art-Academy
         shell: pwsh
         run: |
-          $source = (
-            Resolve-Path ".desktop-package"
-          ).Path
-
           $destination = Join-Path `
             $env:GITHUB_WORKSPACE `
             "windows-build"
 
-          if (Test-Path $destination) {
-            Remove-Item `
-              $destination `
-              -Recurse `
-              -Force
-          }
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $destination |
+            Out-Null
 
-          Move-Item `
-            -Path $source `
-            -Destination $destination
-
-          Write-Host "Artifact contents:"
-          Get-ChildItem $destination -Recurse |
-            Select-Object FullName, Length |
-            Format-Table -AutoSize
-
-          Get-PSDrive C
+          Copy-Item `
+            ".desktop-package\*" `
+            $destination `
+            -Recurse `
+            -Force
 
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
@@ -254,16 +583,23 @@ jobs:
           retention-days: 7
           compression-level: 0
 
-      - name: Upload failure logs
-        if: failure()
+      - name: Upload diagnostic logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Pixel-Art-Academy-build-logs
+          name: Pixel-Art-Academy-diagnostic-logs
           path: |
+            Pixel-Art-Academy/build-logs
             Pixel-Art-Academy/meteor.log
-            Pixel-Art-Academy/npm-debug.log
             Pixel-Art-Academy/.meteor/local/**/*.log
-            meteor-desktop/npm-debug.log
-          if-no-files-found: ignore
-          retention-days: 7
+            Pixel-Art-Academy/.meteor/local/build/programs/web.cordova/program.json
+          if-no-files-found: warn
+          retention-days: 14
           include-hidden-files: true
+
+      - name: Save Meteor cache
+        if: always() && steps.meteor-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~\AppData\Local\.meteor
+          key: ${{ steps.meteor-cache.outputs.cache-primary-key }}
