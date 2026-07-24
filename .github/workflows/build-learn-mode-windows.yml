@@ -195,6 +195,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          $relativeOnnxPath = "public/artificial/mind/onnx"
+
           $onnxPath = Join-Path `
             $PWD `
             "public\artificial\mind\onnx"
@@ -213,6 +215,7 @@ jobs:
 
           if ($existingEntry) {
             Write-Host "Existing entry:"
+
             $existingEntry |
               Select-Object `
                 FullName,
@@ -225,11 +228,15 @@ jobs:
               $existingEntry.Attributes -band
               [System.IO.FileAttributes]::ReparsePoint
             ) {
-              & cmd.exe /d /c `
-                "rmdir `"$onnxPath`""
+              # Удаляем отслеживаемую Git-символическую ссылку,
+              # не пытаясь открыть её целевой каталог.
+              & git.exe rm `
+                -f `
+                -- `
+                $relativeOnnxPath
 
               if ($LASTEXITCODE -ne 0) {
-                throw "Could not remove ONNX directory symlink."
+                throw "Git could not remove the ONNX symlink."
               }
             } else {
               Remove-Item `
@@ -260,11 +267,15 @@ jobs:
             --no-fund `
             onnxruntime-web@1.16.3
 
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not install onnxruntime-web."
+          }
+
           $onnxSource = Join-Path `
             $temporaryInstall `
             "node_modules\onnxruntime-web\dist"
 
-          if (-not (Test-Path $onnxSource)) {
+          if (-not (Test-Path -LiteralPath $onnxSource)) {
             throw "onnxruntime-web dist directory was not created."
           }
 
@@ -280,26 +291,37 @@ jobs:
             -Recurse `
             -Force
 
-          $copiedFiles = Get-ChildItem `
-            -LiteralPath $onnxPath `
-            -File `
-            -Recurse
+          $copiedFiles = @(
+            Get-ChildItem `
+              -LiteralPath $onnxPath `
+              -File `
+              -Recurse
+          )
 
           if ($copiedFiles.Count -eq 0) {
             throw "No ONNX Runtime files were copied."
           }
 
+          $remainingEntry = Get-Item `
+            -LiteralPath $onnxPath `
+            -Force
+
+          if (
+            $remainingEntry.Attributes -band
+            [System.IO.FileAttributes]::ReparsePoint
+          ) {
+            throw "ONNX path is still a symbolic link."
+          }
+
           Write-Host (
-            "Copied {0} ONNX Runtime files." -f
+            "Copied {0} ONNX Runtime files into a real directory." -f
             $copiedFiles.Count
           )
 
           $copiedFiles |
-            Select-Object `
-              Name,
-              Length |
+            Select-Object Name, Length |
             Format-Table -AutoSize
-
+      
       - name: Build Meteor with live diagnostics and package
         working-directory: Pixel-Art-Academy
         shell: pwsh
