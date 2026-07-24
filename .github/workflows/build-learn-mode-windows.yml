@@ -710,9 +710,28 @@ jobs:
                 -TimeoutSec 10 `
                 -UseBasicParsing
 
+              $indexDump = Join-Path `
+                $logDir `
+                "cordova-index.html"
+              
+              $manifestDump = Join-Path `
+                $logDir `
+                "cordova-manifest.json"
+              
+              $index.Content |
+                Set-Content `
+                  -LiteralPath $indexDump `
+                  -Encoding utf8
+              
+              $manifest.Content |
+                Set-Content `
+                  -LiteralPath $manifestDump `
+                  -Encoding utf8
+              
               return (
                 $index.StatusCode -eq 200 -and
-                $manifest.StatusCode -eq 200
+                $manifest.StatusCode -eq 200 -and
+                $index.Content -match "cordova\.js"
               )
             } catch {
               return $false
