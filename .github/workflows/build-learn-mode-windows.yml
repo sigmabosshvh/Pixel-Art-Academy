@@ -189,138 +189,378 @@ jobs:
           $ErrorActionPreference = "Stop"
           meteor npm install
 
-      - name: Replace ONNX symlink with real files
+      - name: Materialize all public symlinks
         working-directory: Pixel-Art-Academy
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $relativeOnnxPath = "public/artificial/mind/onnx"
-
-          $onnxPath = Join-Path `
-            $PWD `
-            "public\artificial\mind\onnx"
-
-          $temporaryInstall = Join-Path `
+          $scriptPath = Join-Path `
             $env:RUNNER_TEMP `
-            "paa-onnxruntime"
+            "materialize-public-symlinks.cjs"
 
-          Write-Host "ONNX repository path:"
-          Write-Host $onnxPath
+          @'
+          const fs = require("fs");
+          const os = require("os");
+          const path = require("path");
+          const crypto = require("crypto");
+          const { execFileSync } = require("child_process");
 
-          $existingEntry = Get-Item `
-            -LiteralPath $onnxPath `
-            -Force `
-            -ErrorAction SilentlyContinue
+          const repositoryRoot = process.cwd();
 
-          if ($existingEntry) {
-            Write-Host "Existing entry:"
+          function run(command, args, options = {}) {
+            return execFileSync(command, args, {
+              cwd: repositoryRoot,
+              encoding: "utf8",
+              stdio: options.stdio || ["ignore", "pipe", "pipe"],
+              ...options,
+            });
+          }
 
-            $existingEntry |
-              Select-Object `
-                FullName,
-                Attributes,
-                LinkType,
-                Target |
-              Format-List
+          function git(args) {
+            return run("git.exe", args);
+          }
 
-            if (
-              $existingEntry.Attributes -band
-              [System.IO.FileAttributes]::ReparsePoint
-            ) {
-              # Удаляем отслеживаемую Git-символическую ссылку,
-              # не пытаясь открыть её целевой каталог.
-              & git.exe rm `
-                -f `
-                -- `
-                $relativeOnnxPath
+          function escapeRegExp(value) {
+            return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          }
 
-              if ($LASTEXITCODE -ne 0) {
-                throw "Git could not remove the ONNX symlink."
-              }
+          function copyTarget(source, destination) {
+            if (!fs.existsSync(source)) {
+              throw new Error(`Source does not exist: ${source}`);
+            }
+
+            fs.mkdirSync(path.dirname(destination), {
+              recursive: true,
+            });
+
+            const sourceStats = fs.statSync(source);
+
+            if (sourceStats.isDirectory()) {
+              fs.mkdirSync(destination, {
+                recursive: true,
+              });
+
+              fs.cpSync(source, destination, {
+                recursive: true,
+                force: true,
+                dereference: true,
+              });
             } else {
-              Remove-Item `
-                -LiteralPath $onnxPath `
-                -Recurse `
-                -Force
+              fs.copyFileSync(source, destination);
             }
           }
 
-          Remove-Item `
-            -LiteralPath $temporaryInstall `
-            -Recurse `
-            -Force `
-            -ErrorAction SilentlyContinue
+          function parseNpmTarget(targetAbsolutePath) {
+            const parts = path.normalize(targetAbsolutePath).split(path.sep);
+            const nodeModulesIndex = parts.lastIndexOf("node_modules");
 
-          New-Item `
-            -ItemType Directory `
-            -Path $temporaryInstall `
-            -Force |
-            Out-Null
+            if (nodeModulesIndex < 0) {
+              return null;
+            }
 
-          npm.cmd install `
-            --prefix $temporaryInstall `
-            --no-save `
-            --no-package-lock `
-            --ignore-scripts `
-            --no-audit `
-            --no-fund `
-            onnxruntime-web@1.16.3
+            let packageName;
+            let packagePartsCount;
+
+            if (
+              parts[nodeModulesIndex + 1] &&
+              parts[nodeModulesIndex + 1].startsWith("@")
+            ) {
+              packageName =
+                `${parts[nodeModulesIndex + 1]}/` +
+                `${parts[nodeModulesIndex + 2]}`;
+
+              packagePartsCount = 2;
+            } else {
+              packageName = parts[nodeModulesIndex + 1];
+              packagePartsCount = 1;
+            }
+
+            if (!packageName) {
+              return null;
+            }
+
+            const packageSubpath = parts.slice(
+              nodeModulesIndex + 1 + packagePartsCount
+            );
+
+            const packagesIndex = parts.lastIndexOf(
+              "packages",
+              nodeModulesIndex
+            );
+
+            if (
+              packagesIndex < 0 ||
+              !parts[packagesIndex + 1]
+            ) {
+              return null;
+            }
+
+            const meteorPackageDirectory = path.join(
+              ...parts.slice(0, packagesIndex + 2)
+            );
+
+            return {
+              packageName,
+              packageSubpath,
+              meteorPackageDirectory,
+            };
+          }
+
+          function findPackageVersion(
+            meteorPackageDirectory,
+            packageName
+          ) {
+            const packageJsPath = path.join(
+              meteorPackageDirectory,
+              "package.js"
+            );
+
+            if (!fs.existsSync(packageJsPath)) {
+              throw new Error(
+                `Meteor package.js was not found: ${packageJsPath}`
+              );
+            }
+
+            const packageJs = fs.readFileSync(
+              packageJsPath,
+              "utf8"
+            );
+
+            const escapedName = escapeRegExp(packageName);
+
+            const versionPattern = new RegExp(
+              `["']${escapedName}["']\\s*:\\s*["']([^"']+)["']`
+            );
+
+            const match = packageJs.match(versionPattern);
+
+            if (!match) {
+              throw new Error(
+                `Could not find npm version for ${packageName} ` +
+                `in ${packageJsPath}`
+              );
+            }
+
+            return match[1];
+          }
+
+          function installNpmTarget(parsedTarget) {
+            const version = findPackageVersion(
+              parsedTarget.meteorPackageDirectory,
+              parsedTarget.packageName
+            );
+
+            const installId = crypto
+              .createHash("sha256")
+              .update(
+                `${parsedTarget.packageName}@${version}`
+              )
+              .digest("hex")
+              .slice(0, 16);
+
+            const installDirectory = path.join(
+              process.env.RUNNER_TEMP || os.tmpdir(),
+              "paa-public-dependencies",
+              installId
+            );
+
+            const packageDirectory = path.join(
+              installDirectory,
+              "node_modules",
+              ...parsedTarget.packageName.split("/")
+            );
+
+            if (!fs.existsSync(packageDirectory)) {
+              fs.mkdirSync(installDirectory, {
+                recursive: true,
+              });
+
+              console.log(
+                `Installing ${parsedTarget.packageName}@${version}`
+              );
+
+              execFileSync(
+                "npm.cmd",
+                [
+                  "install",
+                  "--prefix",
+                  installDirectory,
+                  "--no-save",
+                  "--no-package-lock",
+                  "--ignore-scripts",
+                  "--no-audit",
+                  "--no-fund",
+                  `${parsedTarget.packageName}@${version}`,
+                ],
+                {
+                  cwd: repositoryRoot,
+                  stdio: "inherit",
+                }
+              );
+            }
+
+            const source = path.join(
+              packageDirectory,
+              ...parsedTarget.packageSubpath
+            );
+
+            if (!fs.existsSync(source)) {
+              throw new Error(
+                `Installed package does not contain expected path: ` +
+                `${source}`
+              );
+            }
+
+            return source;
+          }
+
+          const indexOutput = git([
+            "ls-files",
+            "-s",
+            "--",
+            "public",
+          ]);
+
+          const symlinks = indexOutput
+            .split(/\r?\n/)
+            .filter(Boolean)
+            .filter((line) => line.startsWith("120000 "))
+            .map((line) => {
+              const tabIndex = line.indexOf("\t");
+
+              if (tabIndex < 0) {
+                throw new Error(
+                  `Unexpected git ls-files output: ${line}`
+                );
+              }
+
+              return line.slice(tabIndex + 1);
+            });
+
+          console.log(
+            `Found ${symlinks.length} tracked symlink(s) under public.`
+          );
+
+          for (const repositoryPath of symlinks) {
+            const targetText = git([
+              "show",
+              `HEAD:${repositoryPath}`,
+            ]).trim();
+
+            const destination = path.join(
+              repositoryRoot,
+              ...repositoryPath.split("/")
+            );
+
+            const directTarget = path.resolve(
+              path.dirname(destination),
+              targetText
+            );
+
+            console.log("");
+            console.log(`Materializing: ${repositoryPath}`);
+            console.log(`Link target:   ${targetText}`);
+
+            execFileSync(
+              "git.exe",
+              [
+                "rm",
+                "-f",
+                "--",
+                repositoryPath,
+              ],
+              {
+                cwd: repositoryRoot,
+                stdio: "inherit",
+              }
+            );
+
+            let source;
+
+            if (fs.existsSync(directTarget)) {
+              source = directTarget;
+
+              console.log(
+                `Using existing target: ${source}`
+              );
+            } else {
+              const parsedTarget = parseNpmTarget(
+                directTarget
+              );
+
+              if (!parsedTarget) {
+                throw new Error(
+                  `Target is missing and is not an npm path:\n` +
+                  `${directTarget}`
+                );
+              }
+
+              source = installNpmTarget(parsedTarget);
+
+              console.log(
+                `Using npm package target: ${source}`
+              );
+            }
+
+            copyTarget(source, destination);
+
+            const result = fs.lstatSync(destination);
+
+            if (result.isSymbolicLink()) {
+              throw new Error(
+                `Destination is still a symlink: ${destination}`
+              );
+            }
+
+            console.log(
+              `Created real ${result.isDirectory() ? "directory" : "file"}.`
+            );
+          }
+
+          console.log("");
+          console.log(
+            "All tracked public symlinks were materialized."
+          );
+          '@ | Set-Content `
+            -LiteralPath $scriptPath `
+            -Encoding utf8NoBOM
+
+          node.exe $scriptPath
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Could not install onnxruntime-web."
+            throw "Could not materialize public symlinks."
           }
 
-          $onnxSource = Join-Path `
-            $temporaryInstall `
-            "node_modules\onnxruntime-web\dist"
+          Write-Host ""
+          Write-Host "Remaining filesystem reparse points under public:"
 
-          if (-not (Test-Path -LiteralPath $onnxSource)) {
-            throw "onnxruntime-web dist directory was not created."
-          }
-
-          New-Item `
-            -ItemType Directory `
-            -Path $onnxPath `
-            -Force |
-            Out-Null
-
-          Copy-Item `
-            -Path "$onnxSource\*" `
-            -Destination $onnxPath `
-            -Recurse `
-            -Force
-
-          $copiedFiles = @(
+          $remainingLinks = @(
             Get-ChildItem `
-              -LiteralPath $onnxPath `
-              -File `
-              -Recurse
+              "public" `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Attributes -band
+              [System.IO.FileAttributes]::ReparsePoint
+            }
           )
 
-          if ($copiedFiles.Count -eq 0) {
-            throw "No ONNX Runtime files were copied."
+          if ($remainingLinks.Count -gt 0) {
+            $remainingLinks |
+              Select-Object `
+                FullName,
+                LinkType,
+                Target |
+              Format-Table -AutoSize
+
+            throw (
+              "Some reparse points remain under public."
+            )
           }
 
-          $remainingEntry = Get-Item `
-            -LiteralPath $onnxPath `
-            -Force
-
-          if (
-            $remainingEntry.Attributes -band
-            [System.IO.FileAttributes]::ReparsePoint
-          ) {
-            throw "ONNX path is still a symbolic link."
-          }
-
-          Write-Host (
-            "Copied {0} ONNX Runtime files into a real directory." -f
-            $copiedFiles.Count
-          )
-
-          $copiedFiles |
-            Select-Object Name, Length |
-            Format-Table -AutoSize
+          Write-Host "No reparse points remain under public."
       
       - name: Build Meteor with live diagnostics and package
         working-directory: Pixel-Art-Academy
