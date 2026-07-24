@@ -339,7 +339,6 @@ jobs:
             "run",
             "--verbose",
             "--mobile-server=http://127.0.0.1:3000",
-            "--production",
             "-p",
             "3080"
           )
@@ -488,7 +487,6 @@ jobs:
 
             & npm.cmd run desktop -- package `
               http://127.0.0.1:3000 `
-              --production `
               --port 3080 2>&1 |
               Tee-Object -FilePath $packageLog
 
