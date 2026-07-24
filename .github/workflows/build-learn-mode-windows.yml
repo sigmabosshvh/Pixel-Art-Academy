@@ -189,6 +189,117 @@ jobs:
           $ErrorActionPreference = "Stop"
           meteor npm install
 
+      - name: Replace ONNX symlink with real files
+        working-directory: Pixel-Art-Academy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $onnxPath = Join-Path `
+            $PWD `
+            "public\artificial\mind\onnx"
+
+          $temporaryInstall = Join-Path `
+            $env:RUNNER_TEMP `
+            "paa-onnxruntime"
+
+          Write-Host "ONNX repository path:"
+          Write-Host $onnxPath
+
+          $existingEntry = Get-Item `
+            -LiteralPath $onnxPath `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          if ($existingEntry) {
+            Write-Host "Existing entry:"
+            $existingEntry |
+              Select-Object `
+                FullName,
+                Attributes,
+                LinkType,
+                Target |
+              Format-List
+
+            if (
+              $existingEntry.Attributes -band
+              [System.IO.FileAttributes]::ReparsePoint
+            ) {
+              & cmd.exe /d /c `
+                "rmdir `"$onnxPath`""
+
+              if ($LASTEXITCODE -ne 0) {
+                throw "Could not remove ONNX directory symlink."
+              }
+            } else {
+              Remove-Item `
+                -LiteralPath $onnxPath `
+                -Recurse `
+                -Force
+            }
+          }
+
+          Remove-Item `
+            -LiteralPath $temporaryInstall `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          New-Item `
+            -ItemType Directory `
+            -Path $temporaryInstall `
+            -Force |
+            Out-Null
+
+          npm.cmd install `
+            --prefix $temporaryInstall `
+            --no-save `
+            --no-package-lock `
+            --ignore-scripts `
+            --no-audit `
+            --no-fund `
+            onnxruntime-web@1.16.3
+
+          $onnxSource = Join-Path `
+            $temporaryInstall `
+            "node_modules\onnxruntime-web\dist"
+
+          if (-not (Test-Path $onnxSource)) {
+            throw "onnxruntime-web dist directory was not created."
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Path $onnxPath `
+            -Force |
+            Out-Null
+
+          Copy-Item `
+            -Path "$onnxSource\*" `
+            -Destination $onnxPath `
+            -Recurse `
+            -Force
+
+          $copiedFiles = Get-ChildItem `
+            -LiteralPath $onnxPath `
+            -File `
+            -Recurse
+
+          if ($copiedFiles.Count -eq 0) {
+            throw "No ONNX Runtime files were copied."
+          }
+
+          Write-Host (
+            "Copied {0} ONNX Runtime files." -f
+            $copiedFiles.Count
+          )
+
+          $copiedFiles |
+            Select-Object `
+              Name,
+              Length |
+            Format-Table -AutoSize
+
       - name: Build Meteor with live diagnostics and package
         working-directory: Pixel-Art-Academy
         shell: pwsh
