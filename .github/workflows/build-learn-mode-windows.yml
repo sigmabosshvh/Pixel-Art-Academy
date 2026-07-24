@@ -54,31 +54,52 @@ jobs:
           restore-keys: |
             meteor-windows-2.16-
 
-      - name: Install or restore Meteor 2.16
+      - name: Install Meteor launcher and verify project release
+        working-directory: Pixel-Art-Academy
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           $meteorDir = Join-Path $env:LOCALAPPDATA ".meteor"
 
+          # Для текущего шага.
           $env:PATH = "$meteorDir;$env:PATH"
 
+          # Устанавливаем launcher только при его отсутствии.
           if (-not (Get-Command meteor -ErrorAction SilentlyContinue)) {
             npm install --global meteor@2.16.0 --foreground-script
             $env:PATH = "$meteorDir;$env:PATH"
           }
 
-          # PATH последующих шагов.
+          # Для последующих шагов.
           $meteorDir |
             Out-File `
               -FilePath $env:GITHUB_PATH `
               -Encoding utf8 `
               -Append
 
-          $version = meteor --version
-          Write-Host "Meteor version: $version"
+          $expectedRelease = (
+            Get-Content ".meteor/release" -Raw
+          ).Trim()
 
-          if ($version -notmatch "2\.16") {
-            throw "Expected Meteor 2.16, got: $version"
+          Write-Host "Project release file: $expectedRelease"
+          Write-Host "Meteor launcher: $((Get-Command meteor).Source)"
+
+          # Команда выполняется внутри Pixel-Art-Academy,
+          # поэтому Meteor должен выбрать версию проекта.
+          $version = (
+            meteor --version |
+            Out-String
+          ).Trim()
+
+          Write-Host "Project Meteor version: $version"
+
+          if ($expectedRelease -notmatch "^METEOR@2\.16") {
+            throw "Unexpected .meteor/release: $expectedRelease"
+          }
+
+          if ($version -notmatch "^Meteor 2\.16") {
+            throw "Project did not select Meteor 2.16. Actual: $version"
           }
 
       - name: Install and compile meteor-desktop
