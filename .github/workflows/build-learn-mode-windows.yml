@@ -622,6 +622,81 @@ jobs:
           }
 
           Write-Host "No reparse points remain under public."
+
+      - name: Patch GLSL compiler for Windows
+        working-directory: Pixel-Art-Academy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $pluginPath = "packages/api/glslbuildplugin.js"
+
+          @'
+          Plugin.registerCompiler({
+            extensions: ['glsl'],
+            filenames: []
+          }, () => new GLSLCompiler);
+
+          class GLSLCompiler {
+            processFilesForTarget(files) {
+              files.forEach((file) => {
+                // Normalize Windows CRLF before parsing the first line.
+                const glslSource = file
+                  .getContentsAsString()
+                  .replace(/\r\n/g, '\n')
+                  .replace(/\r/g, '\n');
+
+                const newLineLocation = glslSource.indexOf('\n');
+
+                if (newLineLocation < 0) {
+                  throw new Error(
+                    `GLSL file has no first-line variable declaration: ` +
+                    file.getPathInPackage()
+                  );
+                }
+
+                const firstLine = glslSource.slice(
+                  0,
+                  newLineLocation
+                );
+
+                const glslSourceVariable = firstLine
+                  .slice(3)
+                  .trim();
+
+                if (!glslSourceVariable) {
+                  throw new Error(
+                    `GLSL variable name is empty: ` +
+                    file.getPathInPackage()
+                  );
+                }
+
+                const javaScriptSource =
+                  'THREE.ShaderChunk[' +
+                  JSON.stringify(glslSourceVariable) +
+                  '] = ' +
+                  JSON.stringify(glslSource) +
+                  ';';
+
+                file.addJavaScript({
+                  data: javaScriptSource,
+                  path: `${file.getPathInPackage()}-glsl.js`
+                });
+              });
+            }
+          }
+          '@ | Set-Content `
+            -LiteralPath $pluginPath `
+            -Encoding utf8NoBOM
+
+          Write-Host "Patched GLSL build plugin:"
+          Get-Content $pluginPath
+
+          Remove-Item `
+            ".meteor\local" `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
       
       - name: Build Meteor with live diagnostics and package
         working-directory: Pixel-Art-Academy
@@ -872,6 +947,34 @@ jobs:
           try {
             while ($true) {
               $meteorProcess.Refresh()
+
+              if (Test-Path $stdoutLog) {
+                $recentMeteorOutput = (
+                  Get-Content `
+                    $stdoutLog `
+                    -Tail 400 `
+                    -ErrorAction SilentlyContinue
+                ) -join "`n"
+
+                if (
+                  $recentMeteorOutput -match
+                  "Your application has errors\. Waiting for file change\."
+                ) {
+                  Write-Diagnostic (
+                    "Meteor reported compilation errors."
+                  )
+
+                  Show-FileTail `
+                    "Meteor compilation errors" `
+                    $stdoutLog `
+                    400
+
+                  throw (
+                    "Meteor compilation failed and entered " +
+                    "file-watch mode."
+                  )
+                }
+              }
 
               if (Test-MeteorReady) {
                 $ready = $true
