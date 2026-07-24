@@ -102,14 +102,75 @@ jobs:
             throw "Project did not select Meteor 2.16. Actual: $version"
           }
 
-      - name: Install and compile meteor-desktop
+      - name: Install, patch and compile meteor-desktop
         working-directory: meteor-desktop
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
           npm install --no-audit --no-fund
+
+          $patchScript = Join-Path `
+            $env:RUNNER_TEMP `
+            "patch-meteor-desktop.cjs"
+
+          @'
+          const fs = require("fs");
+
+          const file = "lib/meteorApp.js";
+
+          let source = fs.readFileSync(file, "utf8");
+
+          const oldCheck =
+            /if\s*\(\s*~text\.indexOf\(\s*'src="\/cordova\.js"'\s*\)\s*\)\s*\{\s*return text;\s*\}\s*return false;/m;
+
+          if (!oldCheck.test(source)) {
+            throw new Error(
+              "Could not find the old strict cordova.js check " +
+              "in lib/meteorApp.js"
+            );
+          }
+
+          source = source.replace(
+            oldCheck,
+            `
+            if (
+              res.ok &&
+              /(?:src\\s*=\\s*["'][^"']*cordova\\.js[^"']*["']|cordova\\.js)/i.test(text)
+            ) {
+              return text;
+            }
+
+            throw new Error(
+              "Downloaded __cordova/index.html, but it does not " +
+              "appear to be a Cordova index. HTTP status: " +
+              res.status +
+              ". First 500 characters: " +
+              text.slice(0, 500)
+            );
+            `
+          );
+
+          fs.writeFileSync(file, source, "utf8");
+
+          console.log(
+            "Patched meteor-desktop Cordova index validation."
+          );
+          '@ | Set-Content `
+            -LiteralPath $patchScript `
+            -Encoding utf8NoBOM
+
+          node.exe $patchScript
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not patch meteor-desktop."
+          }
+
           npm run build
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not compile meteor-desktop."
+          }
 
           if (-not (Test-Path "dist/bin/cli.js")) {
             throw "meteor-desktop did not produce dist/bin/cli.js"
